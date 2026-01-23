@@ -1,0 +1,17 @@
+torch
+torchvision
+torchaudio
+diffusers==0.27.2
+transformers
+xformers
+imageio
+gradio
+gdown
+einops
+omegaconf
+safetensors
+imageio[ffmpeg]
+imageio[pyav]
+accelerate
+moviepy
+PEFT

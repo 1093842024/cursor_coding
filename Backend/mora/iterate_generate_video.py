@@ -22,6 +22,10 @@ from safetensors.torch import load_file as load_safetensors
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 BASEDIR='/mnt/glennge/MoneyPrinter/Backend/mora/'
 
+# 阶段5 扩展点：文生视频/图生视频可插拔。可在此接入 HunyuanVideo、CogVideoX、Luma、Kling、Minimax 等：
+# def get_t2v_model(name): return {"animatedifflcm": animatedifflcm_model(), "kling": ...}[name]
+# def get_i2v_model(name): return {"svd": svd_model(), "cogvideox": ...}[name]
+
 def I2VGenXL_demo():
     from diffusers import I2VGenXLPipeline
 

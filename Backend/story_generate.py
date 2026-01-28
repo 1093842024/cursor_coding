@@ -3,12 +3,32 @@ from pathlib import Path
 from PIL import Image
 import numpy as np
 import gradio as gr
-from mora.generate_image  import sdxl_lightning_model,sd15_model,ipadapter_model_multi_adapter
+from mora.generate_image  import sdxl_lightning_model,sd15_model,ipadapter_model_multi_adapter,get_t2i_model
 from mora.sd_prompt.sdxl_styles import sdxl_style_template,sdxl_styles
 
 from tts_utils import CH_LANGUAGE_ID,EN_LANGUAGE_ID,translate_ch_to_en,translate_en_to_ch,generate_text_audio
 from video_utils import comb_video
-from llm import _generate_response
+from llm import (
+    _generate_response,
+    expand_story_from_outline,
+    summarize_segment,
+    extract_characters_scenes_detailed,
+    get_segment_characters_scenes,
+    generate_cinematic_storyboard_for_segment,
+)
+# 阶段1：长篇小说按章分段（运行时应以 Backend 为工作目录，以便 from tool. 可用）
+try:
+    from tool.novel_parser import parse_novel_file, segments_to_full_story
+except Exception:
+    import sys as _sys
+    _sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    from tool.novel_parser import parse_novel_file, segments_to_full_story
+# 阶段4：9 宫格一致性生成
+try:
+    from mora.consistency_9grid import generate_9grid_from_reference, GRID_9_PROMPT_SUFFIXES
+except Exception:
+    generate_9grid_from_reference = None
+    GRID_9_PROMPT_SUFFIXES = []
 
 os.environ["no_proxy"] = "localhost,0.0.0.0,:8082"
 style_type=['origin IP-Adapter','only style block','style+layout block']
@@ -16,7 +36,10 @@ MAX_SEED = np.iinfo(np.int32).max
 DEFAULT_NEG_PROMPT="bad hands,bad face,distort limbs,text, watermark, lowres, low quality, worst quality, deformed, glitch, low contrast, noisy, saturation, blurry"
 
 
-DeFault_BGM_path=[file for file in os.listdir('/mnt/glennge/MoneyPrinter/source/Songs/')]
+try:
+    DeFault_BGM_path=[file for file in os.listdir('/mnt/glennge/MoneyPrinter/source/Songs/')]
+except Exception:
+    DeFault_BGM_path=[]
 Max_fenjin_num=20
 
 def generate_fgmaskimg(position,W,H):
@@ -344,20 +367,54 @@ def generate_image_gr_demo(t2imodel):
             gr.Warning('某个角色名不在角色库中')
         return all_images
     
+    # 阶段4：一致性改用 9 宫格时，从 grid_9 选图作为分镜图；景别/镜头类型可映射到 0～8，此处默认用 0
+    def _fenjin_img_from_9grid(ip, scene, prompt, grid_index=0):
+        base_scene = "set_lib/scene/"
+        if scene:
+            path = base_scene + scene.replace("/", "_") + "/grid_9/%d.png" % grid_index
+            if os.path.isfile(path):
+                img = Image.open(path).convert("RGB")
+                return [(img, prompt or "")]
+        base_char = "set_lib/character/"
+        for name in (ip or "").split(","):
+            name = name.strip()
+            if not name or name.lower() == "none":
+                continue
+            path = base_char + name.replace("/", "_") + "/grid_9/%d.png" % grid_index
+            if os.path.isfile(path):
+                img = Image.open(path).convert("RGB")
+                return [(img, prompt or "")]
+        return []
+
+    use_legacy_consistency = False  # 阶段4：默认用 9 宫格；改为 True 可恢复旧 IP-Adapter 路径
+
     def generate_single_fenjin_img(gallery_person,gallery_scene,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,
         mask_img_select,person_scale,bg_scale,
         ip,scene,prompt):
         if prompt is not None and len(prompt)>0 and ip is not None and scene is not None:
-            if mask_img_select is not None and len(mask_img_select)==len(ip.split(',')):
-                images=generate_adapter_person_scene_with_mask_pro(prompt,ip,scene,gallery_person,gallery_scene,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,
-                    mask_img_select,person_scale,bg_scale)
-                return gr.update(value=images,visible=True)
-            else:
-                images=generate_adapter_person_scene(prompt,ip,scene,gallery_person,gallery_scene,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,
-                    person_scale,bg_scale)
-                return gr.update(value=images,visible=True)
-        else:
-            return None
+            if not use_legacy_consistency:
+                images = _fenjin_img_from_9grid(ip, scene, prompt)
+                if images:
+                    return gr.update(value=images, visible=True)
+            # --- legacy IP-Adapter 路径（已注释，需时改 use_legacy_consistency=True 并恢复下面代码）---
+            # if mask_img_select is not None and len(mask_img_select)==len(ip.split(',')):
+            #     images=generate_adapter_person_scene_with_mask_pro(prompt,ip,scene,gallery_person,gallery_scene,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,
+            #         mask_img_select,person_scale,bg_scale)
+            #     return gr.update(value=images,visible=True)
+            # else:
+            #     images=generate_adapter_person_scene(prompt,ip,scene,gallery_person,gallery_scene,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,
+            #         person_scale,bg_scale)
+            #     return gr.update(value=images,visible=True)
+            if use_legacy_consistency:
+                if mask_img_select is not None and len(mask_img_select)==len(ip.split(',')):
+                    images=generate_adapter_person_scene_with_mask_pro(prompt,ip,scene,gallery_person,gallery_scene,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,
+                        mask_img_select,person_scale,bg_scale)
+                    return gr.update(value=images,visible=True)
+                else:
+                    images=generate_adapter_person_scene(prompt,ip,scene,gallery_person,gallery_scene,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,
+                        person_scale,bg_scale)
+                    return gr.update(value=images,visible=True)
+        return None
 
     def generate_all_fenjin_imgs(gallery_person,gallery_scene,seed,num_inference_steps,guidance,width,height,num_img_per_prompt=1,
                                  *ip_scene_prompt):
@@ -375,10 +432,17 @@ def generate_image_gr_demo(t2imodel):
         print(ips,scenes,prompts)
         for i,(ip,scene,prompt) in enumerate(zip(ips,scenes,prompts)):
             if prompt is not None and len(prompt)>0 and ip is not None and scene is not None:
-                images=generate_adapter_person_scene(prompt,ip,scene,gallery_person,gallery_scene,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,
-                    0.5,0.5)
-                fenjin_images[i]=gr.update(value=images,visible=True)
-                yield fenjin_images
+                if not use_legacy_consistency:
+                    images = _fenjin_img_from_9grid(ip, scene, prompt)
+                    if images:
+                        fenjin_images[i] = gr.update(value=images, visible=True)
+                    yield fenjin_images
+                else:
+                    # legacy IP-Adapter: generate_adapter_person_scene(...)
+                    images=generate_adapter_person_scene(prompt,ip,scene,gallery_person,gallery_scene,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,
+                        0.5,0.5)
+                    fenjin_images[i]=gr.update(value=images,visible=True)
+                    yield fenjin_images
     
     def generate_single_fenjin_video(fadeinfadeout,audio,subtitle,img):
         outputdir='data/video/'
@@ -489,35 +553,309 @@ def generate_image_gr_demo(t2imodel):
                 new_gallery.append(data)
         return new_gallery
 
-    def llm_story(prompt,modeltype):
-        story=_generate_response(prompt,modeltype)
+    # ---- 阶段1：主题/梗概扩写与小说分段 ----
+    def _segments_from_story(story_text_val):
+        """从全文按双换行切分为 segments 结构，供后续按段分镜使用。"""
+        if not story_text_val or not story_text_val.strip():
+            return []
+        parts = [p.strip() for p in story_text_val.strip().split("\n\n") if p.strip()]
+        return [{"segment_id": i, "chapter_title": None, "content": p, "summary": ""} for i, p in enumerate(parts)]
+
+    def llm_story(prompt, modeltype, input_mode):
+        # 旧流程：仅 prompt 生成（当 input_mode 为「主题/梗概」且输入较长时仍用原逻辑）
+        if input_mode == "主题/梗概" and prompt and len(prompt.strip()) < 250:
+            story = expand_story_from_outline(prompt.strip(), modeltype, None)
+        else:
+            story = _generate_response(prompt, modeltype)
         return story
+
+    def llm_story_and_sync(prompt, modeltype, input_mode):
+        """生成故事并返回 (story_text, full_story, segments) 以更新 State。"""
+        story = llm_story(prompt, modeltype, input_mode)
+        segs = _segments_from_story(story)
+        return story, story, segs
+
+    def on_parse_novel(novel_file_obj):
+        """长篇小说：上传后解析为章/段，返回 (full_story, full_story, segments, segment_display_text)。"""
+        if not novel_file_obj:
+            return "", "", [], "请先上传 txt 文件"
+        if isinstance(novel_file_obj, (list, tuple)) and novel_file_obj:
+            novel_file_obj = novel_file_obj[0]
+        if hasattr(novel_file_obj, "name"):
+            path = novel_file_obj.name
+        else:
+            path = str(novel_file_obj)
+        if not path or not os.path.isfile(path):
+            return "", "", [], "请先上传有效的 txt 文件"
+        segs = parse_novel_file(path)
+        full = segments_to_full_story(segs)
+        # 用于展示的每段摘要列（待提炼前为空）
+        lines = []
+        for s in segs:
+            tit = s.get("chapter_title") or f"段{s['segment_id']+1}"
+            lines.append(f"[{tit}] {s.get('summary', '(未提炼)')}")
+        return full, full, segs, "\n".join(lines)
+
+    def on_summarize_all(segs, modeltype):
+        """一键提炼各段：对 segments 中每段调用 summarize_segment，更新 summary。"""
+        if not segs:
+            return [], "当前无段落数据，请先上传并解析小说。"
+        out = []
+        lines = []
+        for s in segs:
+            c = s.get("content", "")
+            summ = summarize_segment(c, modeltype, None) if c else ""
+            snew = dict(s)
+            snew["summary"] = summ
+            out.append(snew)
+            tit = snew.get("chapter_title") or f"段{snew['segment_id']+1}"
+            lines.append(f"[{tit}] {summ or '(未提炼)'}")
+        return out, "\n".join(lines)
 
     def llm_person_scene(prompt,story,modeltype):
         newprompt=prompt.replace('{story}',story)
         person_scene=_generate_response(newprompt,modeltype)
         return person_scene
 
+    # 阶段2：解析「名称;外形/画面描述;详细描述」增强格式，得到全局角色/场景列表（含 detailed）
+    def _parse_person_scene_detailed(text):
+        chars, scenes = [], []
+        block = None  # "char" | "scene"
+        for line in text.split("\n"):
+            line = line.strip()
+            if "[Characters]" in line or line == "[Characters]":
+                block = "char"
+                continue
+            if "[Scenes]" in line or line == "[Scenes]":
+                block = "scene"
+                continue
+            parts = [p.strip() for p in line.split(";") if p.strip()]
+            if len(parts) < 2:
+                continue
+            name = parts[0].split(":")[-1].strip() if ":" in parts[0] else parts[0]
+            desc = parts[1].split(":")[-1].strip() if ":" in parts[1] else parts[1]
+            detailed = parts[2].split(":")[-1].strip() if len(parts) > 2 and ":" in parts[2] else desc
+            if block == "char" and ("角色" in line or "外形" in str(parts[0])):
+                chars.append({"name": name, "desc": desc, "detailed": detailed})
+            elif block == "scene" and ("场景" in line or "画面" in str(parts[0])):
+                scenes.append({"name": name, "desc": desc, "detailed": detailed})
+        return chars, scenes
+
+    def llm_person_scene_detailed(story, modeltype):
+        """阶段2：全局角色/场景抽取（含详细描述），返回 (person_scene_text, chars_list, scenes_list)。"""
+        raw = extract_characters_scenes_detailed(story or "", modeltype, None)
+        chars, scenes = _parse_person_scene_detailed(raw)
+        # 写出与旧格式兼容的 person_scene 文本，供 person_scene_text_parse 与后续使用
+        lines = ["[Characters]"]
+        for i, c in enumerate(chars):
+            lines.append(f"角色{i}名称:{c['name']};外形描述:{c['desc']}")
+        lines.append("[Scenes]")
+        for j, s in enumerate(scenes):
+            lines.append(f"场景{j}名称:{s['name']};画面描述:{s['desc']}")
+        return "\n".join(lines), chars, scenes
+
+    def on_label_segment_characters_scenes(segs, chars, scenes, modeltype):
+        """阶段2：为每段标注涉及的角色名、场景名，写入 segment['character_names'] / ['scene_names']。"""
+        if not segs:
+            return [], "无段落数据"
+        cnames = [c["name"] for c in (chars or [])]
+        snames = [s["name"] for s in (scenes or [])]
+        out = []
+        for s in segs:
+            s2 = dict(s)
+            cn, sc = get_segment_characters_scenes(s.get("content", ""), cnames, snames, modeltype, None)
+            s2["character_names"] = cn
+            s2["scene_names"] = sc
+            out.append(s2)
+        msg = "已标注 %d 段" % len(out)
+        return out, msg
+
+    def batch_generate_character_scene_refs(chars, scenes, stylename, seed_val, steps, guid, w, h):
+        """阶段2：根据 state_global_characters/scenes 批量生成所有角色/场景首图并写入 set_lib。"""
+        if not chars and not scenes:
+            return "无角色/场景数据，请先在「角色场景创作」中生成角色场景（详细版）。"
+        base_char = "set_lib/character/"
+        base_scene = "set_lib/scene/"
+        for d in (base_char, base_scene):
+            if not os.path.exists(d):
+                os.makedirs(d, exist_ok=True)
+        report = []
+        for c in (chars or []):
+            name, desc = c.get("name", ""), c.get("desc", "") or c.get("detailed", "")
+            if not name or not desc:
+                continue
+            try:
+                _, pos, _ = sdxl_style_template.get_name_style_prompt(stylename or "No Style", desc)
+                neg = DEFAULT_NEG_PROMPT
+                s = seed_val if seed_val else random.randint(1, MAX_SEED)
+                img = t2imodel.generate_face_style(None, None, pos, neg, steps=steps, seed=s, guidance=guid, width=w, height=h)
+                savedir = base_char + name.replace("/", "_") + "/"
+                os.makedirs(savedir, exist_ok=True)
+                path = savedir + str(time.time()) + ".png"
+                img.save(path)
+                report.append("角色: " + name)
+            except Exception as e:
+                report.append("角色 %s 失败: %s" % (name, str(e)))
+        for s in (scenes or []):
+            name, desc = s.get("name", ""), s.get("desc", "") or s.get("detailed", "")
+            if not name or not desc:
+                continue
+            try:
+                _, pos, _ = sdxl_style_template.get_name_style_prompt(stylename or "No Style", desc)
+                neg = DEFAULT_NEG_PROMPT
+                s = seed_val if seed_val else random.randint(1, MAX_SEED)
+                img = t2imodel.generate_face_style(None, None, pos, neg, steps=steps, seed=s, guidance=guid, width=w, height=h)
+                savedir = base_scene + name.replace("/", "_") + "/"
+                os.makedirs(savedir, exist_ok=True)
+                path = savedir + str(time.time()) + ".png"
+                img.save(path)
+                report.append("场景: " + name)
+            except Exception as e:
+                report.append("场景 %s 失败: %s" % (name, str(e)))
+        return "\n".join(report) if report else "未生成任何图片"
+
+    def batch_generate_9grid_for_characters_scenes(chars, scenes, seed_val, steps, guid, w, h):
+        """阶段4：为每个角色/场景从 set_lib 取首图作参考，生成 9 宫格并写入 grid_9/。"""
+        if not generate_9grid_from_reference:
+            return "未加载 consistency_9grid 模块"
+        base_char = "set_lib/character/"
+        base_scene = "set_lib/scene/"
+        report = []
+        opts = {"negative_prompt": DEFAULT_NEG_PROMPT, "seed": seed_val}
+
+        def local_gen(prompt, neg):
+            s = (seed_val or random.randint(1, MAX_SEED))
+            return t2imodel.generate_face_style(None, None, prompt, neg, steps=steps, seed=s, guidance=guid, width=w, height=h)
+
+        for c in (chars or []):
+            name, desc = c.get("name", ""), (c.get("desc") or c.get("detailed", ""))
+            if not name:
+                continue
+            dirname = base_char + name.replace("/", "_") + "/"
+            if not os.path.isdir(dirname):
+                report.append("角色 %s 尚无首图目录，请先一键生成首图" % name)
+                continue
+            imgs = [os.path.join(dirname, f) for f in os.listdir(dirname) if f.endswith(".png") and "grid" not in f]
+            ref = (imgs[0] if imgs else None) or os.path.join(dirname, "ref.png")
+            if not imgs and not os.path.isfile(ref):
+                report.append("角色 %s 无参考图，跳过 9 宫格" % name)
+                continue
+            if imgs and not os.path.isfile(ref):
+                ref = imgs[0]
+            grid_dir = os.path.join(dirname, "grid_9")
+            os.makedirs(grid_dir, exist_ok=True)
+            try:
+                out = generate_9grid_from_reference(ref, "character", desc, opts, backend="local", local_generate_fn=local_gen)
+                for i, img in enumerate(out):
+                    if i < 9:
+                        img.save(os.path.join(grid_dir, "%d.png" % i))
+                report.append("角色 %s: 已写 grid_9 (%d 张)" % (name, len(out)))
+            except Exception as e:
+                report.append("角色 %s 失败: %s" % (name, str(e)))
+        for s in (scenes or []):
+            name, desc = s.get("name", ""), (s.get("desc") or s.get("detailed", ""))
+            if not name:
+                continue
+            dirname = base_scene + name.replace("/", "_") + "/"
+            if not os.path.isdir(dirname):
+                report.append("场景 %s 尚无首图目录" % name)
+                continue
+            imgs = [os.path.join(dirname, f) for f in os.listdir(dirname) if f.endswith(".png") and "grid" not in f]
+            ref = (imgs[0] if imgs else None) or os.path.join(dirname, "ref.png")
+            if not imgs and not os.path.isfile(ref):
+                report.append("场景 %s 无参考图，跳过" % name)
+                continue
+            if imgs and not os.path.isfile(ref):
+                ref = imgs[0]
+            grid_dir = os.path.join(dirname, "grid_9")
+            os.makedirs(grid_dir, exist_ok=True)
+            try:
+                out = generate_9grid_from_reference(ref, "scene", desc, opts, backend="local", local_generate_fn=local_gen)
+                for i, img in enumerate(out):
+                    if i < 9:
+                        img.save(os.path.join(grid_dir, "%d.png" % i))
+                report.append("场景 %s: 已写 grid_9 (%d 张)" % (name, len(out)))
+            except Exception as e:
+                report.append("场景 %s 失败: %s" % (name, str(e)))
+        return "\n".join(report) if report else "未处理任何角色/场景"
+
     def person_scene_text_parse(person_scene):
-        persons=[]
-        scenes=[]
-        for line in person_scene.split('\n'):
-            if '角色' in line  and '外形' in line:
-                name,desc=line.split(';')
-                name=name.split(':')[-1]
-                desc=desc.split(':')[-1]
-                persons.append(name+':'+desc)
-            if '场景' in line  and '画面' in line:
-                name,desc=line.split(';')
-                name=name.split(':')[-1]
-                desc=desc.split(':')[-1]
-                scenes.append(name+':'+desc)
-        return gr.update(choices=persons,value=persons[0]),gr.update(choices=scenes,value=scenes[0])
+        persons = []
+        scenes = []
+        for line in person_scene.split("\n"):
+            if "角色" in line and "外形" in line:
+                parts = line.split(";")
+                name = parts[0].split(":")[-1].strip() if parts else ""
+                desc = parts[1].split(":")[-1].strip() if len(parts) > 1 else ""
+                if name or desc:
+                    persons.append(name + ":" + desc)
+            if "场景" in line and "画面" in line:
+                parts = line.split(";")
+                name = parts[0].split(":")[-1].strip() if parts else ""
+                desc = parts[1].split(":")[-1].strip() if len(parts) > 1 else ""
+                if name or desc:
+                    scenes.append(name + ":" + desc)
+        return (
+            gr.update(choices=persons, value=persons[0] if persons else None),
+            gr.update(choices=scenes, value=scenes[0] if scenes else None),
+        )
 
     def llm_fenjing(prompt,story,person_scene,modeltype):
         newprompt=prompt.replace('{person_scene}',person_scene).replace('{story}',story)
         fenjin_response=_generate_response(newprompt,modeltype)
         return fenjin_response
+
+    def _parse_cinematic_shot_line(line):
+        """解析单行电影化分镜，返回 dict(narration, characters, scene, prompt, shot_type, scale)。"""
+        d = {"narration": "", "characters": "", "scene": "", "prompt": "", "shot_type": "", "scale": ""}
+        if "->" not in line:
+            return d
+        _, rest = line.split("->", 1)
+        for part in rest.split(";"):
+            part = part.strip()
+            if ":" not in part:
+                continue
+            k, v = part.split(":", 1)
+            v = v.strip().rstrip(".")
+            k = k.strip()
+            if "旁白" in k or k == "旁白内容":
+                d["narration"] = v
+            elif "角色" in k or k == "角色":
+                d["characters"] = v
+            elif "场景" in k or k == "场景":
+                d["scene"] = v
+            elif "画面prompt" in k or k == "画面prompt":
+                d["prompt"] = v
+            elif "镜头类型" in k or k == "镜头类型":
+                d["shot_type"] = v
+            elif "景别" in k or k == "景别":
+                d["scale"] = v
+        return d
+
+    def on_generate_cinematic_storyboards(segs, modeltype):
+        """阶段3：按段生成电影化分镜，写入 state_storyboards，并返回与旧格式兼容的 content_text。"""
+        if not segs:
+            return "", [], "无段落数据"
+        all_boards = []
+        legacy_lines = []
+        for seg_idx, s in enumerate(segs):
+            content = s.get("content", "") or s.get("summary", "")
+            cnames = s.get("character_names") or []
+            snames = s.get("scene_names") or []
+            raw = generate_cinematic_storyboard_for_segment(content, cnames, snames, modeltype, None)
+            shots = []
+            for line in (raw or "").split("\n"):
+                line = line.strip()
+                if not line or "->" not in line:
+                    continue
+                d = _parse_cinematic_shot_line(line)
+                shots.append(d)
+                legacy_lines.append(
+                    "分镜%i画面%i->旁白内容:%s;角色:%s;场景:%s;画面prompt:%s."
+                    % (seg_idx + 1, len(shots), d["narration"], d["characters"], d["scene"], d["prompt"])
+                )
+            all_boards.append(shots)
+        return "\n".join(legacy_lines), all_boards, "已生成 %d 段分镜" % len(all_boards)
 
     def fenjin_parse(content_text):
         fenjin_person=[]
@@ -621,26 +959,53 @@ def generate_image_gr_demo(t2imodel):
             return selectlib(libnames,dirpath)
 
 
-    with gr.Blocks(title='安全管理部-视觉生成技术') as demo:   
+    with gr.Blocks(title='安全管理部-视觉生成技术') as demo:
+        # 阶段1/6：全局状态，供多模态输入与后续按段分镜使用
+        state_full_story = gr.State(value="")
+        state_segments = gr.State(value=[])
+        # 阶段2：全局角色/场景（含详细描述），用于按段标注与批量首图
+        state_global_characters = gr.State(value=[])
+        state_global_scenes = gr.State(value=[])
+        # 阶段3：按段电影化分镜，每条含 narration/characters/scene/prompt/shot_type/scale
+        state_storyboards = gr.State(value=[])
         with gr.Tab('故事动画生成'):
-            gr.Markdown('1、故事和角色内容生成')
+            gr.Markdown('1、故事和角色内容生成\n\n（阶段6 配置：`T2I_MODEL`、`USE_CONSISTENCY_BACKEND`、`NANO_BANANA_API_KEY` 等见环境变量）')
             with gr.Tab('故事创作'):
+                input_mode = gr.Radio(
+                    choices=["主题/梗概", "长篇小说"],
+                    value="主题/梗概",
+                    label="输入模式",
+                )
+                # 主题/梗概：保留原有 story_prompt + 生成按钮
                 with gr.Row():
-                    story_prompt=gr.Textbox(value=Default_story_prompt,label='故事prompt',scale=3,max_lines=3)
+                    story_prompt=gr.Textbox(value=Default_story_prompt,label='故事prompt（主题/梗概时使用）',scale=3,max_lines=3)
                     generate_story_text=gr.Button('生成故事设定与描述',variant="primary")
                 story_text=gr.Textbox(label='总体故事text',max_lines=8)
+                # 长篇小说：上传 + 解析 + 一键提炼各段
+                gr.Markdown("---\n**长篇小说**：上传 txt 后点击「解析为章/段」，再可「一键提炼各段」生成摘要；全文将用于角色/场景抽取。")
+                with gr.Row():
+                    novel_file = gr.File(label="上传小说 (txt)", file_types=[".txt"])
+                    btn_parse_novel = gr.Button("解析为章/段", variant="secondary")
+                segment_display = gr.Textbox(label="各段摘要（解析或提炼后更新）", lines=6, max_lines=12)
+                btn_summarize_all = gr.Button("一键提炼各段", variant="secondary")
+                gr.Markdown("**阶段2**：在「角色场景创作」中生成角色场景（详细版）后，可对当前段落标注涉及的角色/场景：")
+                btn_label_segment_cs = gr.Button("按段标注角色场景", variant="secondary")
+                segment_status = gr.Textbox(label="按段标注状态", value="", interactive=False)
             with gr.Tab('角色场景创作/分镜创作'):
-                with gr. Row():
+                with gr.Row():
                     with gr.Column():
                         with gr.Row():
                             person_scene_prompt=gr.Textbox(value=Default_person_scene_prompt,label='角色场景prompt',scale=3,max_lines=3)
                             generate_ps_text=gr.Button('生成角色场景text',variant="primary")
+                            generate_ps_detailed_btn=gr.Button('生成角色场景（详细版）',variant="secondary")
                         person_scene_text=gr.Textbox(value=DeFault_person_scene_text,label='角色场景text',max_lines=8) 
                     with gr.Column():
                         with gr.Row():
                             content_prompt=gr.Textbox(value=DeFault_fenjin_prompt,label='分镜prompt',scale=3,max_lines=3)
                             generate_content_text=gr.Button('生成分镜描述',variant="primary",scale=1)
-                        content_text=gr.Textbox(value=DeFault_fenjin_text,label='分镜text',max_lines=8) 
+                            btn_cinematic_sb=gr.Button('按段生成电影化分镜',variant="secondary")
+                        content_text=gr.Textbox(value=DeFault_fenjin_text,label='分镜text',max_lines=8)
+                        cinematic_sb_status=gr.Textbox(label='电影化分镜状态',value='',interactive=False) 
 
             
             with gr.Row():
@@ -649,7 +1014,7 @@ def generate_image_gr_demo(t2imodel):
                 with gr.Column(scale=9):
                     with gr.Accordion('图像生成参数设置', open=False):
                         with gr.Row(): 
-                            modeltype=gr.Dropdown(choices=['sdxl_lightning'],value='sdxl_lightning',label='文生图模型')
+                            modeltype=gr.Dropdown(choices=['sdxl_lightning','sd15','ipadapter'],value='sdxl_lightning',label='文生图模型（阶段5：可扩展 flux/sd3，需重启并设 T2I_MODEL）')
                             seed = gr.Slider(0, 10000000000000, 0, label='seed', step=1)
                             guidance = gr.Slider(0, 10, 1, label='guidance', step=0.5)
                             width = gr.Slider(480, 1920, 1024, label='width', step=24)
@@ -657,11 +1022,52 @@ def generate_image_gr_demo(t2imodel):
                             num_inference_steps=gr.Slider(1, 8, 4, label='infer steps', step=1)
                             num_img_per_prompt=gr.Slider(1, 4, 3, label='imgnum/prompt', step=1)
             
-            generate_story_text.click(llm_story,inputs=[story_prompt,llm_modeltype],outputs=[story_text])   
-            generate_ps_text.click(llm_person_scene,inputs=[person_scene_prompt,story_text,llm_modeltype],outputs=[person_scene_text])   
-            generate_content_text.click(llm_fenjing,inputs=[content_prompt,story_text,person_scene_text,llm_modeltype],outputs=[content_text])  
-                    
+            # 阶段1：主题/梗概走扩写或原逻辑，并同步 full_story / segments
+            generate_story_text.click(
+                llm_story_and_sync,
+                inputs=[story_prompt, llm_modeltype, input_mode],
+                outputs=[story_text, state_full_story, state_segments],
+            )
+            btn_parse_novel.click(
+                on_parse_novel,
+                inputs=[novel_file],
+                outputs=[story_text, state_full_story, state_segments, segment_display],
+            )
+            btn_summarize_all.click(
+                on_summarize_all,
+                inputs=[state_segments, llm_modeltype],
+                outputs=[state_segments, segment_display],
+            )
+            btn_label_segment_cs.click(
+                on_label_segment_characters_scenes,
+                inputs=[state_segments, state_global_characters, state_global_scenes, llm_modeltype],
+                outputs=[state_segments, segment_status],
+            )
+            generate_ps_text.click(llm_person_scene,inputs=[person_scene_prompt,story_text,llm_modeltype],outputs=[person_scene_text])
+            # 阶段2：详细版角色/场景抽取，写入 state_global_characters / state_global_scenes
+            generate_ps_detailed_btn.click(
+                llm_person_scene_detailed,
+                inputs=[story_text, llm_modeltype],
+                outputs=[person_scene_text, state_global_characters, state_global_scenes],
+            )
+            generate_content_text.click(llm_fenjing,inputs=[content_prompt,story_text,person_scene_text,llm_modeltype],outputs=[content_text])
+            # 阶段3：按段生成电影化分镜（需先完成按段标注角色场景）
+            btn_cinematic_sb.click(
+                on_generate_cinematic_storyboards,
+                inputs=[state_segments, llm_modeltype],
+                outputs=[content_text, state_storyboards, cinematic_sb_status],
+            )
             with gr.Tab('2、角色设定图/场景设定图生成'):
+                # 阶段2：批量生成全部角色/场景首图（新流程）
+                gr.Markdown("**阶段2**：使用下方「图像生成参数」与风格，对当前全局角色/场景各生成一张首图并写入角色库/场景库。")
+                with gr.Row():
+                    btn_batch_refs = gr.Button("一键生成全部角色/场景首图", variant="primary")
+                    batch_refs_report = gr.Textbox(label="批量首图生成结果", lines=4, interactive=False)
+                # 阶段4：为每个角色/场景生成 9 宫格一致性图（需先有首图）
+                gr.Markdown("**阶段4**：在首图生成后，为每个角色/场景生成 9 宫格（多视角/景别）并写入 `grid_9/`。")
+                with gr.Row():
+                    btn_batch_9grid = gr.Button("为全部角色/场景生成 9 宫格", variant="secondary")
+                    batch_9grid_report = gr.Textbox(label="9 宫格生成结果", lines=3, interactive=False)
                 with gr.Row():
                     with gr.Column(scale=1):
                         with gr.Row():
@@ -755,7 +1161,18 @@ def generate_image_gr_demo(t2imodel):
                 generate_scene.click(generate_no_ref,inputs=input_scene,outputs=[scene_img])
                 input_scene_simple=[scene_simple_neg,scene_simple_pos,style_ref,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,scene_scale_simple]
                 generate_scene_simple.click(generate_adapter_scene,inputs=input_scene_simple,outputs=[scene_img])
-                
+                # 阶段2：一键生成全部角色/场景首图
+                btn_batch_refs.click(
+                    batch_generate_character_scene_refs,
+                    inputs=[state_global_characters, state_global_scenes, stylename, seed, num_inference_steps, guidance, width, height],
+                    outputs=[batch_refs_report],
+                )
+                # 阶段4：为全部角色/场景生成 9 宫格
+                btn_batch_9grid.click(
+                    batch_generate_9grid_for_characters_scenes,
+                    inputs=[state_global_characters, state_global_scenes, seed, num_inference_steps, guidance, width, height],
+                    outputs=[batch_9grid_report],
+                )
             with gr.Tab('3、分镜音视频生成'):
                 with gr.Row():
                     language=gr.Radio(choices=['en','zh'],value='en',label='旁白字幕语言',visible=False)
@@ -897,10 +1314,10 @@ def generate_image_gr_demo(t2imodel):
         
     
 if __name__ =="__main__":
+    # 阶段5：经 get_t2i_model 按名称加载；可通过环境变量 T2I_MODEL=sdxl_lightning|sd15|ipadapter 选择
     try:
-        #t2imodel=sdxl_lightning_model()
-        t2imodel=ipadapter_model_multi_adapter(lightning=True)
-        #t2imodel=sd15_model()
+        t2imodel = get_t2i_model(os.environ.get("T2I_MODEL", "ipadapter"))
+        # t2imodel=ipadapter_model_multi_adapter(lightning=True)  # 旧写法，已改为上
     except Exception as e:
         print('t2i error',e)
         t2imodel=sd15_model()

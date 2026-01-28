@@ -838,6 +838,18 @@ class ipadapter_model_multi_adapter():
 
 
         
+# 阶段5：文生图/图生图模型可插拔入口；按名称返回实例，便于 story_generate 或环境变量选择
+def get_t2i_model(name="sdxl_lightning", **kwargs):
+    """可选 name: sdxl_lightning, sd15, ipadapter。后续可扩展 flux, sd3 等。"""
+    if name == "sdxl_lightning":
+        return sdxl_lightning_model(**kwargs)
+    if name == "sd15":
+        return sd15_model(**kwargs)
+    if name in ("ipadapter", "ip_adapter"):
+        return ipadapter_model_multi_adapter(lightning=True, **kwargs)
+    return sdxl_lightning_model(**kwargs)
+
+
 def regenerate_template():
     from sd_prompt.sdxl_styles import sdxl_styles
     sl_model=sdxl_lightning_model(instantstyle=False,controlnet=False,savememory=False)

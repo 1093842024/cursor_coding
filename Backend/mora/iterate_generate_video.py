@@ -189,7 +189,34 @@ def iterate_generate_video(imagepath,iter_num=5,pipe=None,pipetype='svd'):
         final_clip.write_videofile("data/final_output_video.mp4")
     
     generate_and_concatenate_videos(imagepath,iter_num)
-    
+
+
+def svd_image_to_video(image_path: str, output_path: str, num_frames: int = 14, fps: int = 7, seed: int = None) -> str:
+    """
+    单图 I2V：用 Stable Video Diffusion 生成短视频并写入 output_path。
+    供 video_gen._run_i2v_t2v 等调用。model_id="svd" 时使用。
+    """
+    image_path = (image_path or "").strip()
+    if not image_path or not os.path.isfile(image_path):
+        raise FileNotFoundError("svd_image_to_video 需要有效的图片路径: %s" % image_path)
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    repo = os.environ.get("SVD_MODEL_PATH", "stabilityai/stable-video-diffusion-img2vid-xt-1-1")
+    pipe = StableVideoDiffusionPipeline.from_pretrained(
+        repo, torch_dtype=torch.float16, variant="fp16", use_safetensors=True
+    )
+    pipe.enable_model_cpu_offload()
+    image = Image.open(image_path).convert("RGB").resize((1024, 576))
+    gen = torch.Generator(device="cpu").manual_seed(seed if seed is not None else int(time.time()))
+    frames = pipe(
+        image,
+        decode_chunk_size=min(12, num_frames),
+        generator=gen,
+        motion_bucket_id=127,
+    ).frames[0]
+    export_to_video(frames, output_path, fps=fps)
+    return output_path
+
+
 def resize_image(image, output_size=(1024, 576)):
     # Calculate aspect ratios
     target_aspect = output_size[0] / output_size[1]  # Aspect ratio of the desired size

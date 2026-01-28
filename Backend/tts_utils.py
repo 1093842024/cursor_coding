@@ -13,9 +13,9 @@ import time,datetime,json
 from moviepy.editor import *
 
 
-#sys.path.append('/Users/glennge/work/cv/diffusion/MoneyPrinter/Backend/OpenVoice_en/')
-#from tts.OpenVoice_en.openvoice_demo import openvoice_tts
-from tts.edgetts_demo import edgetts_api,EN_LANGUAGE_ID,CH_LANGUAGE_ID
+# sys.path.append(...)
+# from tts.OpenVoice_en.openvoice_demo import openvoice_tts
+from tts.edgetts_demo import edgetts_api, EN_LANGUAGE_ID, CH_LANGUAGE_ID
 
 
 def translate(text, to_language="en", text_language="zh-CN"):
@@ -96,19 +96,83 @@ def generate_script_audio(scripfile,outputdir='data/audio/',tts_type='edgetts'):
             os.remove(f'{outputdir}script{idx+1}.vtt')
 
 
-edge_tts_tool=edgetts_api()
+_edge_tts_tool = edgetts_api()
 
-def generate_text_audio(text,voice,datafilename,rate=0,outputdir='data/audio/'):
-    if not os.path.exists(outputdir):os.makedirs(outputdir)
+
+def synthesize(
+    text: str,
+    voice_or_speaker_id: str,
+    rate: float = 0,
+    output_path: str = None,
+    subtitle_path: str = None,
+    backend: str = None,
+    model_id: str = None,
+) -> tuple:
+    """
+    统一 TTS 入口。返回 (audio_path, subtitle_path)，subtitle_path 可为 None。
+    backend: edgetts | qwen3_tts | qwen_tts，默认 edgetts。
+    model_id: 可选，如 qwen3-tts-flash。
+    """
+    backend = (backend or "edgetts").strip().lower()
+    if backend in ("qwen3_tts", "qwen_tts", "qwen3-tts"):
+        from tts.qwen3_tts import synthesize as _qwen_synth
+        return _qwen_synth(
+            text=text,
+            voice_or_speaker_id=voice_or_speaker_id,
+            rate=rate,
+            output_path=output_path,
+            subtitle_path=subtitle_path,
+            model_id=model_id,
+        )
+    # 默认 Edge-TTS
+    if not output_path:
+        output_path = "data/audio/tts_out.mp3"
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    base = os.path.splitext(output_path)[0]
+    vtt_path = base + ".vtt"
+    srt_path = subtitle_path or (base + ".srt")
+    voice = (voice_or_speaker_id or "zh-CN-YunxiNeural").split(":")[0]
+    rate_str = f"+{int(rate)}%" if rate >= 0 else f"{int(rate)}%"
+    _edge_tts_tool.sync_tts(text, output_path, webvitfile=vtt_path, voice=voice, rate=rate_str)
+    convert_vtt_srt_ast(vtt_path, srt_path)
+    if os.path.isfile(vtt_path):
+        os.remove(vtt_path)
+    return output_path, srt_path
+
+
+def generate_text_audio(
+    text,
+    voice,
+    datafilename,
+    rate=0,
+    outputdir="data/audio/",
+    tts_backend: str = None,
+    tts_model_id: str = None,
+):
+    """生成单段配音。voice 为 Edge 的 voice 或 Qwen 音色名。增加 tts_backend、tts_model_id 下传到 synthesize。"""
+    if not os.path.exists(outputdir):
+        os.makedirs(outputdir)
+    if tts_backend and tts_backend.lower() in ("qwen3_tts", "qwen_tts", "qwen3-tts"):
+        out_mp3 = os.path.join(outputdir, f"{datafilename}.mp3")
+        out_srt = os.path.join(outputdir, f"{datafilename}.srt")
+        return synthesize(
+            text, voice, rate,
+            output_path=out_mp3,
+            subtitle_path=out_srt,
+            backend=tts_backend,
+            model_id=tts_model_id,
+        )
     if voice not in EN_LANGUAGE_ID and voice not in CH_LANGUAGE_ID:
-        return None,None
-    else:
-        edge_tts_tool.sync_tts(text,f'{outputdir}{datafilename}.mp3',
-                            webvitfile=f'{outputdir}{datafilename}.vtt',
-                            voice=voice,rate=rate)
-        convert_vtt_srt_ast(f'{outputdir}{datafilename}.vtt',f'{outputdir}{datafilename}.srt')
-        os.remove(f'{outputdir}{datafilename}.vtt')
-        return f'{outputdir}{datafilename}.mp3',f'{outputdir}{datafilename}.srt'
+        return None, None
+    out_mp3 = os.path.join(outputdir, f"{datafilename}.mp3")
+    out_srt = os.path.join(outputdir, f"{datafilename}.srt")
+    return synthesize(
+        text, voice, rate,
+        output_path=out_mp3,
+        subtitle_path=out_srt,
+        backend=tts_backend or "edgetts",
+        model_id=tts_model_id,
+    )
 
 def translate_en_to_ch(text):
     return translate(text,'zh-CN','en')

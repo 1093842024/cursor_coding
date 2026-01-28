@@ -3,11 +3,21 @@ from pathlib import Path
 from PIL import Image
 import numpy as np
 import gradio as gr
-from mora.generate_image  import sdxl_lightning_model,sd15_model,ipadapter_model_multi_adapter,get_t2i_model
+from mora.generate_image  import (
+    sdxl_lightning_model,
+    sd15_model,
+    ipadapter_model_multi_adapter,
+    get_t2i_model,
+    T2I_BACKEND_OPEN_SOURCE,
+    T2I_BACKEND_COMMERCIAL,
+    T2I_OPEN_SOURCE_MODEL_IDS,
+    T2I_COMMERCIAL_MODEL_IDS,
+)
 from mora.sd_prompt.sdxl_styles import sdxl_style_template,sdxl_styles
 
 from tts_utils import CH_LANGUAGE_ID,EN_LANGUAGE_ID,translate_ch_to_en,translate_en_to_ch,generate_text_audio
 from video_utils import comb_video
+from video_gen import generate_shot_video
 from llm import (
     _generate_response,
     expand_story_from_outline,
@@ -444,22 +454,28 @@ def generate_image_gr_demo(t2imodel):
                     fenjin_images[i]=gr.update(value=images,visible=True)
                     yield fenjin_images
     
-    def generate_single_fenjin_video(fadeinfadeout,audio,subtitle,img):
+    def generate_single_fenjin_video(fadeinfadeout,audio,subtitle,img,video_backend,video_model_id,i):
         outputdir='data/video/'
+        backend = (video_backend or "slideshow").strip().lower()
+        model_id = (video_model_id or "").strip() or None
         if audio is not None and subtitle is not None and img is not None and len(audio)>0 and len(subtitle)>0:
             imagefiles=[]
             for data in img:
                 imgpath,label=data
                 imagefiles.append(imgpath)
             allimagefiles=';'.join(imagefiles)
-            video=comb_video.image_to_video_with_audio_subtitle(allimagefiles,audio,subtitle,outputdir,f'video_{i}.mp4',fadeinfadeout)
+            video = generate_shot_video(
+                allimagefiles, audio, subtitle,
+                output_dir=outputdir, savename=f'video_{i}.mp4',
+                backend=backend, model_id=model_id, fadetime=float(fadeinfadeout or 1),
+            )
             print(video,subtitle)
             return gr.update(value=video,visible=True)
         else:
             return None
 
 
-    def generate_all_fenjin_video(fadeinfadeout,*audio_subtitle_img):
+    def generate_all_fenjin_video(fadeinfadeout,video_backend,video_model_id,*audio_subtitle_img):
         outputdir='data/video/'
         if not os.path.exists(outputdir):os.makedirs(outputdir)
         fenjin_video=[None]*Max_fenjin_num
@@ -472,6 +488,8 @@ def generate_image_gr_demo(t2imodel):
                 subtitles.append(data)
             else:
                 imgs.append(data)
+        backend = (video_backend or "slideshow").strip().lower()
+        model_id = (video_model_id or "").strip() or None
         print(audios,subtitles,imgs)
         for i,(audio,subtitle,img) in enumerate(zip(audios,subtitles,imgs)):
             if audio is not None and subtitle is not None and img is not None and len(audio)>0 and len(subtitle)>0:
@@ -480,7 +498,11 @@ def generate_image_gr_demo(t2imodel):
                     imgpath,label=data
                     imagefiles.append(imgpath)
                 allimagefiles=';'.join(imagefiles)
-                video=comb_video.image_to_video_with_audio_subtitle(allimagefiles,audio,subtitle,outputdir,f'video_{i}.mp4',fadeinfadeout)
+                video = generate_shot_video(
+                    allimagefiles, audio, subtitle,
+                    output_dir=outputdir, savename=f'video_{i}.mp4',
+                    backend=backend, model_id=model_id, fadetime=float(fadeinfadeout or 1),
+                )
                 fenjin_video[i]=gr.update(value=video,visible=True)
                 print(i,video,subtitle)
                 #yield fenjin_video
@@ -491,19 +513,19 @@ def generate_image_gr_demo(t2imodel):
                 #fenjin_video.append(gr.update(value=None,visible=False))
         return fenjin_video
     
-    def generate_single_tts(pb_tts_id,ps_tts_id,language,rate,audiotext):
+    def generate_single_tts(pb_tts_id,ps_tts_id,language,rate,audiotext,tts_backend,tts_model_id):
         if audiotext is not None and len(audiotext)>1:
             if language!='en':
                 tmpat=translate_en_to_ch(audiotext)
                 if len(tmpat)>1:audiotext=tmpat
-            audiofile,subtitlefile=generate_text_audio(audiotext,pb_tts_id,f'audio',rate)
+            audiofile,subtitlefile=generate_text_audio(audiotext,pb_tts_id,f'audio',rate,tts_backend=tts_backend,tts_model_id=tts_model_id)
             addata=gr.update(value=audiofile,visible=True)
             adst=gr.update(value=subtitlefile,visible=True)
             return addata,adst
         else:
             return None,None
 
-    def generate_tts(pb_tts_id,ps_tts_id,language,rate,*audiotext):
+    def generate_tts(pb_tts_id,ps_tts_id,language,rate,tts_backend,tts_model_id,*audiotext):
         addata=[gr.update(value=None,visible=False)]*Max_fenjin_num
         adst=[gr.update(value=None,visible=False)]*Max_fenjin_num
         print(pb_tts_id,ps_tts_id,audiotext)
@@ -512,7 +534,7 @@ def generate_image_gr_demo(t2imodel):
                 if language!='en':
                     tmpat=translate_en_to_ch(at)
                     if len(tmpat)>1:at=tmpat
-                audiofile,subtitlefile=generate_text_audio(at,pb_tts_id,f'audio_{i}',rate)
+                audiofile,subtitlefile=generate_text_audio(at,pb_tts_id,f'audio_{i}',rate,tts_backend=tts_backend,tts_model_id=tts_model_id)
                 addata[i]=gr.update(value=audiofile,visible=True)
                 adst[i]=gr.update(value=subtitlefile,visible=True)
                 yield addata+adst
@@ -670,10 +692,11 @@ def generate_image_gr_demo(t2imodel):
         msg = "已标注 %d 段" % len(out)
         return out, msg
 
-    def batch_generate_character_scene_refs(chars, scenes, stylename, seed_val, steps, guid, w, h):
+    def batch_generate_character_scene_refs(chars, scenes, stylename, seed_val, steps, guid, w, h, t2i_backend, t2i_model_id):
         """阶段2：根据 state_global_characters/scenes 批量生成所有角色/场景首图并写入 set_lib。"""
         if not chars and not scenes:
             return "无角色/场景数据，请先在「角色场景创作」中生成角色场景（详细版）。"
+        model = get_t2i_model(backend=t2i_backend or T2I_BACKEND_OPEN_SOURCE, model_id=t2i_model_id or "sdxl_lightning")
         base_char = "set_lib/character/"
         base_scene = "set_lib/scene/"
         for d in (base_char, base_scene):
@@ -688,7 +711,7 @@ def generate_image_gr_demo(t2imodel):
                 _, pos, _ = sdxl_style_template.get_name_style_prompt(stylename or "No Style", desc)
                 neg = DEFAULT_NEG_PROMPT
                 s = seed_val if seed_val else random.randint(1, MAX_SEED)
-                img = t2imodel.generate_face_style(None, None, pos, neg, steps=steps, seed=s, guidance=guid, width=w, height=h)
+                img = model.generate_face_style(None, None, pos, neg, steps=steps, seed=s, guidance=guid, width=w, height=h)
                 savedir = base_char + name.replace("/", "_") + "/"
                 os.makedirs(savedir, exist_ok=True)
                 path = savedir + str(time.time()) + ".png"
@@ -704,7 +727,7 @@ def generate_image_gr_demo(t2imodel):
                 _, pos, _ = sdxl_style_template.get_name_style_prompt(stylename or "No Style", desc)
                 neg = DEFAULT_NEG_PROMPT
                 s = seed_val if seed_val else random.randint(1, MAX_SEED)
-                img = t2imodel.generate_face_style(None, None, pos, neg, steps=steps, seed=s, guidance=guid, width=w, height=h)
+                img = model.generate_face_style(None, None, pos, neg, steps=steps, seed=s, guidance=guid, width=w, height=h)
                 savedir = base_scene + name.replace("/", "_") + "/"
                 os.makedirs(savedir, exist_ok=True)
                 path = savedir + str(time.time()) + ".png"
@@ -714,10 +737,11 @@ def generate_image_gr_demo(t2imodel):
                 report.append("场景 %s 失败: %s" % (name, str(e)))
         return "\n".join(report) if report else "未生成任何图片"
 
-    def batch_generate_9grid_for_characters_scenes(chars, scenes, seed_val, steps, guid, w, h):
+    def batch_generate_9grid_for_characters_scenes(chars, scenes, seed_val, steps, guid, w, h, t2i_backend, t2i_model_id):
         """阶段4：为每个角色/场景从 set_lib 取首图作参考，生成 9 宫格并写入 grid_9/。"""
         if not generate_9grid_from_reference:
             return "未加载 consistency_9grid 模块"
+        model = get_t2i_model(backend=t2i_backend or T2I_BACKEND_OPEN_SOURCE, model_id=t2i_model_id or "sdxl_lightning")
         base_char = "set_lib/character/"
         base_scene = "set_lib/scene/"
         report = []
@@ -725,7 +749,7 @@ def generate_image_gr_demo(t2imodel):
 
         def local_gen(prompt, neg):
             s = (seed_val or random.randint(1, MAX_SEED))
-            return t2imodel.generate_face_style(None, None, prompt, neg, steps=steps, seed=s, guidance=guid, width=w, height=h)
+            return model.generate_face_style(None, None, prompt, neg, steps=steps, seed=s, guidance=guid, width=w, height=h)
 
         for c in (chars or []):
             name, desc = c.get("name", ""), (c.get("desc") or c.get("detailed", ""))
@@ -958,18 +982,102 @@ def generate_image_gr_demo(t2imodel):
     def selectaction_lib(libnames,dirpath='set_lib/action/'):
             return selectlib(libnames,dirpath)
 
+    # ---- 各生成 Tab 的本页测试（内置示例，不依赖其它 Tab）----
+    def test_tab1_story(llm_modeltype):
+        """Tab1 本页测试：固定主题扩写 → 故事/分段展示。"""
+        outline = "两只小青蛙，一只坐井观天，一只勇敢探索外面的世界。"
+        story = expand_story_from_outline(outline, llm_modeltype or "moonshot", None)
+        segs = _segments_from_story(story)
+        return story, story, segs
+
+    def test_tab2_characters_scenes(llm_modeltype):
+        """Tab2 本页测试：固定短故事 → 角色场景 + 电影化分镜 → 本 Tab 展示。"""
+        short = "井底有两只青蛙。小蓝总看天，小绿想出去。小绿跳出井口，看到草地与河流，回来告诉小蓝。最后两只青蛙一起跳出了井。"
+        raw = extract_characters_scenes_detailed(short, llm_modeltype or "moonshot", None)
+        chars, scenes = _parse_person_scene_detailed(raw)
+        lines = ["[Characters]"]
+        for i, c in enumerate(chars):
+            lines.append("角色%d名称:%s;外形描述:%s" % (i, c.get("name",""), c.get("desc","")))
+        lines.append("[Scenes]")
+        for j, s in enumerate(scenes):
+            lines.append("场景%d名称:%s;画面描述:%s" % (j, s.get("name",""), s.get("desc","")))
+        person_scene_text = "\n".join(lines)
+        cnames = [c.get("name") for c in chars if c.get("name")]
+        snames = [s.get("name") for s in scenes if s.get("name")]
+        seg = {"segment_id": 0, "content": short[:80], "character_names": cnames[:2], "scene_names": snames[:2]}
+        raw_sb = generate_cinematic_storyboard_for_segment(short[:150], cnames, snames, llm_modeltype or "moonshot", None)
+        boards = []
+        legacy = []
+        for line in (raw_sb or "").split("\n"):
+            line = line.strip()
+            if not line or "->" not in line: continue
+            d = _parse_cinematic_shot_line(line)
+            boards.append(d)
+            legacy.append("分镜1画面%d->旁白内容:%s;角色:%s;场景:%s;画面prompt:%s." % (len(boards), d["narration"], d["characters"], d["scene"], d["prompt"]))
+        return person_scene_text, chars, scenes, "\n".join(legacy), [boards], "本页测试已生成角色/场景与分镜"
+
+    def test_tab3_refs_and_shots(t2i_backend=None, t2i_model_id=None):
+        """Tab3 本页测试：固定 prompt + 当前 T2I 生成示例图，在 Gallery 展示。"""
+        prompt = "a cute frog in a green meadow, cartoon style"
+        seed = random.randint(1, MAX_SEED)
+        try:
+            model = get_t2i_model(backend=t2i_backend, model_id=t2i_model_id)
+            img = model.generate_face_style(None, None, prompt, DEFAULT_NEG_PROMPT, steps=4, seed=seed, guidance=1.0, width=512, height=512)
+            return [(img, prompt)]
+        except Exception as e:
+            return [(None, "本页测试失败: %s" % str(e))]
+
+    def test_tab4_tts_and_shot_video(pangbai_tts_id, rate_val, tts_backend=None, tts_model_id=None):
+        """Tab4 本页测试：固定旁白 TTS + 示例图 slideshow → 音频与一条分镜视频。"""
+        text = "这是一段本页测试旁白，用于验证 TTS 与分镜视频链路。"
+        voice = pangbai_tts_id or (CH_LANGUAGE_ID[0] if CH_LANGUAGE_ID else "zh-CN-YunxiNeural")
+        outdir = "data/audio/"
+        if not os.path.exists(outdir): os.makedirs(outdir)
+        try:
+            audio_path, sub_path = generate_text_audio(
+                text, voice, "test_tab4", rate=rate_val or 0, outputdir=outdir,
+                tts_backend=tts_backend, tts_model_id=tts_model_id or None,
+            )
+        except Exception:
+            return gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+        vidir = "data/video/"
+        if not os.path.exists(vidir): os.makedirs(vidir)
+        video_path = None
+        try:
+            from video_gen import generate_shot_video
+            for p in ["data/image/dragon_baby1.png", "data/image/boy.png"]:
+                if os.path.isfile(p): video_path = generate_shot_video(p, audio_path, sub_path, output_dir=vidir, savename="test_tab4.mp4", backend="slideshow", fadetime=0.5); break
+        except Exception:
+            pass
+        return gr.update(value=audio_path, visible=True), gr.update(value=sub_path, visible=True), gr.update(value=video_path, visible=video_path is not None)
+
+    def test_tab5_final_export():
+        """Tab5 本页测试：内置示例分镜路径或占位 → 合成短线成片；缺片段时提示先跑 Tab4 测试。"""
+        vdir = "data/video/"
+        cand = [os.path.join(vdir, "test_tab4.mp4"), os.path.join(vdir, "video_0.mp4")]
+        existing = [p for p in cand if os.path.isfile(p)]
+        if not existing:
+            raise gr.Error("暂无分镜视频。请先在「配音与分镜视频」Tab 点击「本页测试」或生成分镜视频后再导出。")
+        outpath = os.path.join(vdir, "finalvideo_test.mp4")
+        try:
+            comb_video.generate_final_video(existing, None, None, vdir, "finalvideo_test.mp4", bgm=None, bgmvolume=0)
+            return outpath if os.path.isfile(outpath) else existing[0]
+        except Exception as e:
+            raise gr.Error("成片合成失败: %s" % str(e))
 
     with gr.Blocks(title='安全管理部-视觉生成技术') as demo:
-        # 阶段1/6：全局状态，供多模态输入与后续按段分镜使用
+        # 全局状态（AGENT 命名）：跨 Tab 自动导入下一环节
         state_full_story = gr.State(value="")
         state_segments = gr.State(value=[])
-        # 阶段2：全局角色/场景（含详细描述），用于按段标注与批量首图
         state_global_characters = gr.State(value=[])
         state_global_scenes = gr.State(value=[])
-        # 阶段3：按段电影化分镜，每条含 narration/characters/scene/prompt/shot_type/scale
         state_storyboards = gr.State(value=[])
-        with gr.Tab('故事动画生成'):
-            gr.Markdown('1、故事和角色内容生成\n\n（阶段6 配置：`T2I_MODEL`、`USE_CONSISTENCY_BACKEND`、`NANO_BANANA_API_KEY` 等见环境变量）')
+        state_shot_images = gr.State(value=[])
+        state_shot_audios = gr.State(value=[])
+        state_shot_videos = gr.State(value=[])
+        gr.Markdown('**流程**：Tab1 故事与剧本 → Tab2 角色与场景 → Tab3 角色/场景图与分镜画面 → Tab4 配音与分镜视频 → Tab5 成片导出。各 Tab 可单独「本页测试」。')
+        with gr.Tab('1、故事与剧本'):
+            gr.Markdown('**故事与剧本**：主题/梗概扩写、小说解析、按段摘要。')
             with gr.Tab('故事创作'):
                 input_mode = gr.Radio(
                     choices=["主题/梗概", "长篇小说"],
@@ -991,30 +1099,24 @@ def generate_image_gr_demo(t2imodel):
                 gr.Markdown("**阶段2**：在「角色场景创作」中生成角色场景（详细版）后，可对当前段落标注涉及的角色/场景：")
                 btn_label_segment_cs = gr.Button("按段标注角色场景", variant="secondary")
                 segment_status = gr.Textbox(label="按段标注状态", value="", interactive=False)
-            with gr.Tab('角色场景创作/分镜创作'):
                 with gr.Row():
-                    with gr.Column():
-                        with gr.Row():
-                            person_scene_prompt=gr.Textbox(value=Default_person_scene_prompt,label='角色场景prompt',scale=3,max_lines=3)
-                            generate_ps_text=gr.Button('生成角色场景text',variant="primary")
-                            generate_ps_detailed_btn=gr.Button('生成角色场景（详细版）',variant="secondary")
-                        person_scene_text=gr.Textbox(value=DeFault_person_scene_text,label='角色场景text',max_lines=8) 
-                    with gr.Column():
-                        with gr.Row():
-                            content_prompt=gr.Textbox(value=DeFault_fenjin_prompt,label='分镜prompt',scale=3,max_lines=3)
-                            generate_content_text=gr.Button('生成分镜描述',variant="primary",scale=1)
-                            btn_cinematic_sb=gr.Button('按段生成电影化分镜',variant="secondary")
-                        content_text=gr.Textbox(value=DeFault_fenjin_text,label='分镜text',max_lines=8)
-                        cinematic_sb_status=gr.Textbox(label='电影化分镜状态',value='',interactive=False) 
-
-            
+                    btn_test_tab1 = gr.Button("本页测试", variant="secondary")
             with gr.Row():
                 with gr.Column(scale=1):
                     llm_modeltype=gr.Dropdown(choices=['moonshot','gpt3.5-turbo','glm'],value='moonshot',label='语言模型')
                 with gr.Column(scale=9):
                     with gr.Accordion('图像生成参数设置', open=False):
-                        with gr.Row(): 
-                            modeltype=gr.Dropdown(choices=['sdxl_lightning','sd15','ipadapter'],value='sdxl_lightning',label='文生图模型（阶段5：可扩展 flux/sd3，需重启并设 T2I_MODEL）')
+                        with gr.Row():
+                            t2i_backend = gr.Dropdown(
+                                choices=[T2I_BACKEND_OPEN_SOURCE, T2I_BACKEND_COMMERCIAL],
+                                value=T2I_BACKEND_OPEN_SOURCE,
+                                label="文生图后端（商用/开源）",
+                            )
+                            t2i_model_id = gr.Dropdown(
+                                choices=T2I_OPEN_SOURCE_MODEL_IDS + T2I_COMMERCIAL_MODEL_IDS,
+                                value="sdxl_lightning",
+                                label="文生图模型",
+                            )
                             seed = gr.Slider(0, 10000000000000, 0, label='seed', step=1)
                             guidance = gr.Slider(0, 10, 1, label='guidance', step=0.5)
                             width = gr.Slider(480, 1920, 1024, label='width', step=24)
@@ -1026,6 +1128,11 @@ def generate_image_gr_demo(t2imodel):
             generate_story_text.click(
                 llm_story_and_sync,
                 inputs=[story_prompt, llm_modeltype, input_mode],
+                outputs=[story_text, state_full_story, state_segments],
+            )
+            btn_test_tab1.click(
+                test_tab1_story,
+                inputs=[llm_modeltype],
                 outputs=[story_text, state_full_story, state_segments],
             )
             btn_parse_novel.click(
@@ -1043,6 +1150,23 @@ def generate_image_gr_demo(t2imodel):
                 inputs=[state_segments, state_global_characters, state_global_scenes, llm_modeltype],
                 outputs=[state_segments, segment_status],
             )
+        with gr.Tab('2、角色与场景'):
+            gr.Markdown('**角色与场景**：角色/场景抽取、按段标注、电影化分镜。输入默认来自 Tab1 的 story_text / state。')
+            with gr.Row():
+                with gr.Column():
+                    with gr.Row():
+                        person_scene_prompt=gr.Textbox(value=Default_person_scene_prompt,label='角色场景prompt',scale=3,max_lines=3)
+                        generate_ps_text=gr.Button('生成角色场景text',variant="primary")
+                        generate_ps_detailed_btn=gr.Button('生成角色场景（详细版）',variant="secondary")
+                    person_scene_text=gr.Textbox(value=DeFault_person_scene_text,label='角色场景text',max_lines=8)
+                with gr.Column():
+                    with gr.Row():
+                        content_prompt=gr.Textbox(value=DeFault_fenjin_prompt,label='分镜prompt',scale=3,max_lines=3)
+                        generate_content_text=gr.Button('生成分镜描述',variant="primary",scale=1)
+                        btn_cinematic_sb=gr.Button('按段生成电影化分镜',variant="secondary")
+                    content_text=gr.Textbox(value=DeFault_fenjin_text,label='分镜text',max_lines=8)
+                    cinematic_sb_status=gr.Textbox(label='电影化分镜状态',value='',interactive=False)
+                    btn_test_tab2 = gr.Button("本页测试", variant="secondary")
             generate_ps_text.click(llm_person_scene,inputs=[person_scene_prompt,story_text,llm_modeltype],outputs=[person_scene_text])
             # 阶段2：详细版角色/场景抽取，写入 state_global_characters / state_global_scenes
             generate_ps_detailed_btn.click(
@@ -1057,11 +1181,17 @@ def generate_image_gr_demo(t2imodel):
                 inputs=[state_segments, llm_modeltype],
                 outputs=[content_text, state_storyboards, cinematic_sb_status],
             )
-            with gr.Tab('2、角色设定图/场景设定图生成'):
-                # 阶段2：批量生成全部角色/场景首图（新流程）
-                gr.Markdown("**阶段2**：使用下方「图像生成参数」与风格，对当前全局角色/场景各生成一张首图并写入角色库/场景库。")
+            btn_test_tab2.click(
+                test_tab2_characters_scenes,
+                inputs=[llm_modeltype],
+                outputs=[person_scene_text, state_global_characters, state_global_scenes, content_text, state_storyboards, cinematic_sb_status],
+            )
+        with gr.Tab('3、角色/场景图与分镜画面'):
+                gr.Markdown("**角色/场景图与分镜画面**：设定图、9 宫格、每镜选图。使用「图像生成参数」与风格。")
+                gr.Markdown("批量生成全部角色/场景首图并写入角色库/场景库；可再为每个角色/场景生成 9 宫格。")
                 with gr.Row():
                     btn_batch_refs = gr.Button("一键生成全部角色/场景首图", variant="primary")
+                    btn_test_tab3 = gr.Button("本页测试", variant="secondary")
                     batch_refs_report = gr.Textbox(label="批量首图生成结果", lines=4, interactive=False)
                 # 阶段4：为每个角色/场景生成 9 宫格一致性图（需先有首图）
                 gr.Markdown("**阶段4**：在首图生成后，为每个角色/场景生成 9 宫格（多视角/景别）并写入 `grid_9/`。")
@@ -1164,27 +1294,35 @@ def generate_image_gr_demo(t2imodel):
                 # 阶段2：一键生成全部角色/场景首图
                 btn_batch_refs.click(
                     batch_generate_character_scene_refs,
-                    inputs=[state_global_characters, state_global_scenes, stylename, seed, num_inference_steps, guidance, width, height],
+                    inputs=[state_global_characters, state_global_scenes, stylename, seed, num_inference_steps, guidance, width, height, t2i_backend, t2i_model_id],
                     outputs=[batch_refs_report],
                 )
                 # 阶段4：为全部角色/场景生成 9 宫格
                 btn_batch_9grid.click(
                     batch_generate_9grid_for_characters_scenes,
-                    inputs=[state_global_characters, state_global_scenes, seed, num_inference_steps, guidance, width, height],
+                    inputs=[state_global_characters, state_global_scenes, seed, num_inference_steps, guidance, width, height, t2i_backend, t2i_model_id],
                     outputs=[batch_9grid_report],
                 )
-            with gr.Tab('3、分镜音视频生成'):
+                btn_test_tab3.click(test_tab3_refs_and_shots, inputs=[t2i_backend, t2i_model_id], outputs=[person_img])
+        with gr.Tab('4、配音与分镜视频'):
                 with gr.Row():
                     language=gr.Radio(choices=['en','zh'],value='en',label='旁白字幕语言',visible=False)
                     with gr.Column():
                         with gr.Row():
                             pangbai_tts_id = gr.Dropdown(choices=CH_LANGUAGE_ID+EN_LANGUAGE_ID,value=CH_LANGUAGE_ID[0],label='旁白声personid')
                             person_tts_id = gr.Dropdown(choices=CH_LANGUAGE_ID+EN_LANGUAGE_ID,value=CH_LANGUAGE_ID[2],label='角色声音id')
+                        with gr.Row():
+                            tts_backend = gr.Dropdown(choices=["edgetts", "qwen3_tts"], value="edgetts", label="TTS 引擎")
+                            tts_model_id = gr.Textbox(value="", label="TTS 模型（可选）", placeholder="qwen3-tts-flash 等，留空用默认")
                     with gr.Column():
                         generate_fenjin_tts = gr.Button('生成所有分镜旁白',variant="primary")
+                        btn_test_tab4 = gr.Button("本页测试", variant="secondary")
                     with gr.Column():
                         rate= gr.Slider(-100, 100, 0, label='语速', step=1)
                         fadeinfadeout = gr.Slider(0, 5, 1, label='渐入渐出时长', step=0.5)
+                    with gr.Column():
+                        video_backend = gr.Dropdown(choices=["slideshow", "i2v", "t2v"], value="slideshow", label="分镜视频后端")
+                        video_model_id = gr.Dropdown(choices=["svd", "wan2.2"], value="svd", label="I2V/T2V 模型（仅 i2v/t2v 时有效）")
                     with gr.Column():
                         person_scale=gr.Slider(0, 1, 1, label='人物mask权重', step=0.1)
                         bg_scale=gr.Slider(0, 1, 1, label='背景mask权重', step=0.1)
@@ -1273,24 +1411,49 @@ def generate_image_gr_demo(t2imodel):
             register_action.click(register_img_to_candi,inputs=[action_fg_mask,register_action_name,action_img_select],outputs=[action_img_select])
                 
 
-            generate_fenjin_tts.click(generate_tts,inputs=[pangbai_tts_id,person_tts_id,language,rate]+audiotext,outputs=audiodata+audiosubtitle)
+            generate_fenjin_tts.click(
+                generate_tts,
+                inputs=[pangbai_tts_id, person_tts_id, language, rate, tts_backend, tts_model_id] + audiotext,
+                outputs=audiodata+audiosubtitle,
+            )
             
             for i in range(Max_fenjin_num):
-                fenjin_audio_generate[i].click(generate_single_tts,inputs=[pangbai_tts_id,person_tts_id,language,rate,audiotext[i]],outputs=[audiodata[i],audiosubtitle[i]])
+                def _single_video_fn(idx):
+                    return lambda f, a, s, img, vb, vm: generate_single_fenjin_video(f, a, s, img, vb, vm, idx)
+                fenjin_audio_generate[i].click(
+                    generate_single_tts,
+                    inputs=[pangbai_tts_id, person_tts_id, language, rate, audiotext[i], tts_backend, tts_model_id],
+                    outputs=[audiodata[i], audiosubtitle[i]],
+                )
                 fenjin_img_generate[i].click(generate_single_fenjin_img,inputs=[person_img_select,scene_img_select,seed,num_inference_steps,guidance,width,height,num_img_per_prompt,
                             mask_img_select,person_scale,bg_scale,
                             IP_type[i],scene_type[i],fenjin_img_prompt[i]],outputs=[fenjin_imgs[i]])
                 fenjin_imgs[i].select(get_select_to_candi_image,inputs=[fenjin_imgs_select[i]],outputs=[fenjin_imgs_select[i]])
                 fenjin_imgs_select[i].select(get_select_to_remove,inputs=[fenjin_imgs_select[i]],outputs=[fenjin_imgs_select[i]])
-                fenjin_video_generate[i].click(generate_single_fenjin_video,inputs=[fadeinfadeout,audiodata[i],audiosubtitle[i],fenjin_imgs_select[i]],outputs=videoclip[i])
+                fenjin_video_generate[i].click(
+                    _single_video_fn(i),
+                    inputs=[fadeinfadeout, audiodata[i], audiosubtitle[i], fenjin_imgs_select[i], video_backend, video_model_id],
+                    outputs=[videoclip[i]],
+                )
             
 
             generate_fenjin.click(generate_all_fenjin_imgs,
                                       inputs=[person_img_select,scene_img_select,seed,num_inference_steps,guidance,width,height,num_img_per_prompt]+IP_type+scene_type+fenjin_img_prompt,
                                       outputs=fenjin_imgs)
-            generate_fenjin_video.click(generate_all_fenjin_video,inputs=[fadeinfadeout]+audiodata+audiosubtitle+fenjin_imgs_select,outputs=videoclip)
+            generate_fenjin_video.click(
+                generate_all_fenjin_video,
+                inputs=[fadeinfadeout, video_backend, video_model_id] + audiodata + audiosubtitle + fenjin_imgs_select,
+                outputs=videoclip,
+            )
+            if audiodata and audiosubtitle and videoclip:
+                btn_test_tab4.click(
+                    test_tab4_tts_and_shot_video,
+                    inputs=[pangbai_tts_id, rate, tts_backend, tts_model_id],
+                    outputs=[audiodata[0], audiosubtitle[0], videoclip[0]],
+                )
                 
-            gr.Markdown('4、完整视频生成')
+        with gr.Tab('5、成片导出'):
+            gr.Markdown('**成片导出**：片头片尾、BGM、分镜列表合成。')
             with gr.Row():
                 with gr.Column(scale=1):
                     start_img = gr.Image('data/image/dragon_baby1.png',type='filepath',label='片头',show_download_button=True)
@@ -1306,18 +1469,23 @@ def generate_image_gr_demo(t2imodel):
                         endtext=gr.Textbox(value='～晚安好梦～',label='片尾字')
                 with gr.Column(scale=2):
                     generate_allvideo = gr.Button('生成完整视频',variant="primary")
-                    allvideo = gr.Video(label='完整视频',show_download_button=True)  
+                    btn_test_tab5 = gr.Button("本页测试", variant="secondary")
+                    allvideo = gr.Video(label='完整视频',show_download_button=True)
             bgmlist.select(get_bgm_song,inputs=bgmlist,outputs=[BGM])
-            generate_allvideo.click(generate_final_video,inputs=[start_img,end_img,BGM,volumn,starttext,storyname,endtext]+videoclip,outputs=[allvideo])                         
-    return demo       
+            generate_allvideo.click(generate_final_video,inputs=[start_img,end_img,BGM,volumn,starttext,storyname,endtext]+videoclip,outputs=[allvideo])
+            btn_test_tab5.click(test_tab5_final_export, inputs=[], outputs=[allvideo])
+    return demo
     
         
     
 if __name__ =="__main__":
-    # 阶段5：经 get_t2i_model 按名称加载；可通过环境变量 T2I_MODEL=sdxl_lightning|sd15|ipadapter 选择
+    # 阶段5：经 get_t2i_model(backend, model_id) 按多后端加载；环境变量 T2I_BACKEND、T2I_MODEL
     try:
-        t2imodel = get_t2i_model(os.environ.get("T2I_MODEL", "ipadapter"))
-        # t2imodel=ipadapter_model_multi_adapter(lightning=True)  # 旧写法，已改为上
+        t2imodel = get_t2i_model(
+            backend=os.environ.get("T2I_BACKEND"),
+            model_id=os.environ.get("T2I_MODEL", "ipadapter"),
+        )
+        # 兼容旧写法：仅传 name 时 get_t2i_model 内部按 name 作 model_id 并推断 backend
     except Exception as e:
         print('t2i error',e)
         t2imodel=sd15_model()

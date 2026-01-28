@@ -1,17 +1,33 @@
-import torch,sys,os,cv2
+import logging
+import torch
+import sys
+import os
+import cv2
 from diffusers import DiffusionPipeline
-from diffusers import StableDiffusionXLPipeline, UNet2DConditionModel, EulerDiscreteScheduler,DDIMScheduler,TCDScheduler
+from diffusers import StableDiffusionXLPipeline, UNet2DConditionModel, EulerDiscreteScheduler, DDIMScheduler, TCDScheduler
 from diffusers import ControlNetModel, StableDiffusionXLControlNetPipeline
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 from PIL import Image
 import numpy as np
 import gradio as gr
-import sys,os
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-curdir = os.path.dirname(os.path.abspath(__file__))
 
+device = "cuda" if torch.cuda.is_available() else "cpu"
+curdir = os.path.dirname(os.path.abspath(__file__))
 sys.path.append(curdir)
+
+# 便于从 Backend 根目录解析 config_loader（story_generate 等从 Backend 启动）
+_backend_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _backend_dir not in sys.path:
+    sys.path.insert(0, _backend_dir)
+
+logger = logging.getLogger(__name__)
+
+# ---- T2I/I2I 多后端常量（AGENT.md 3.2）----
+T2I_BACKEND_OPEN_SOURCE = "open_source"
+T2I_BACKEND_COMMERCIAL = "commercial"
+T2I_OPEN_SOURCE_MODEL_IDS = ["flux_dev", "flux_schnell", "z_image_turbo", "sdxl_lightning", "sd15", "ipadapter"]
+T2I_COMMERCIAL_MODEL_IDS = ["nano_banana_pro", "tongyi", "bytedance", "kling"]
 
 def sdxl_demo(prompt):
     # load both base & refiner
@@ -838,16 +854,294 @@ class ipadapter_model_multi_adapter():
 
 
         
-# 阶段5：文生图/图生图模型可插拔入口；按名称返回实例，便于 story_generate 或环境变量选择
-def get_t2i_model(name="sdxl_lightning", **kwargs):
-    """可选 name: sdxl_lightning, sd15, ipadapter。后续可扩展 flux, sd3 等。"""
-    if name == "sdxl_lightning":
-        return sdxl_lightning_model(**kwargs)
-    if name == "sd15":
-        return sd15_model(**kwargs)
-    if name in ("ipadapter", "ip_adapter"):
+# ---- 统一 T2I 接口：generate / generate_from_image / generate_face_style（AGENT.md 3.2）----
+# 供仅支持 T2I 的模型（如 sdxl_lightning/sd15）包装成与 ipadapter 同义的 generate_face_style 调用
+class _UnifiedT2IWrapper:
+    """包装仅有 generate/generate_style 的本地模型，使其支持 generate_face_style(face_image, style_images, prompt, ...)。"""
+
+    def __init__(self, inner):
+        self._inner = inner
+
+    def generate_face_style(
+        self,
+        face_image,
+        style_images,
+        prompt,
+        negative_prompt="",
+        steps=4,
+        seed=0,
+        guidance=1.0,
+        width=1024,
+        height=1024,
+        face_scale=1.0,
+        bgstyle_scale=1.0,
+        onlystyle=False,
+        **kwargs,
+    ):
+        if face_image is None and (style_images is None or len(style_images) == 0):
+            return self._inner.generate(
+                prompt, negative_prompt, guidance=guidance, seed=seed, width=width, height=height,
+                num_inference_steps=steps, **kwargs
+            )
+        if hasattr(self._inner, "generate_style") and style_images and len(style_images) > 0:
+            ref = style_images[0] if isinstance(style_images, (list, tuple)) else style_images
+            return self._inner.generate_style(
+                ref, prompt, negative_prompt=negative_prompt, guidance=guidance, seed=seed,
+                width=width, height=height, num_inference_steps=steps, **kwargs
+            )
+        return self._inner.generate(
+            prompt, negative_prompt, guidance=guidance, seed=seed, width=width, height=height,
+            num_inference_steps=steps, **kwargs
+        )
+
+    def generate_face_style_mask(
+        self, style_images, style_masks, face_images, face_masks, prompt, negative_prompt,
+        steps=20, seed=0, guidance=1.0, width=1024, height=1024, face_scale=1.0, bgstyle_scale=1.0,
+    ):
+        raise NotImplementedError("generate_face_style_mask 仅支持 ipadapter 后端，请选用 ipadapter 或 commercial 后端。")
+
+
+# ---- 开源后端：Flux（flux_dev / flux_schnell）----
+class _FluxT2IAdapter:
+    """Flux.1 Schnell/Dev 文生图，统一成 generate_face_style。无参考时走 T2I，有参考时可用首图做 I2I（若管线支持）。"""
+
+    def __init__(self, model_id="flux_schnell", device=None, savememory=True, **kwargs):
+        self.model_id = model_id
+        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self._savememory = savememory
+        self._pipe = None
+        self._load_pipe(**kwargs)
+
+    def _load_pipe(self, **kwargs):
+        try:
+            from diffusers import FluxPipeline
+        except ImportError:
+            raise RuntimeError("使用 Flux 后端需要 diffusers 支持 FluxPipeline，请升级: pip install -U diffusers")
+        repo = "black-forest-labs/FLUX.1-schnell" if self.model_id == "flux_schnell" else "black-forest-labs/FLUX.1-dev"
+        dtype = torch.bfloat16 if getattr(torch, "bfloat16", None) else torch.float16
+        self._pipe = FluxPipeline.from_pretrained(repo, torch_dtype=dtype, **kwargs)
+        if self._savememory:
+            self._pipe.enable_model_cpu_offload()
+        else:
+            self._pipe.to(self._device)
+
+    def generate_face_style(
+        self,
+        face_image,
+        style_images,
+        prompt,
+        negative_prompt="",
+        steps=4,
+        seed=0,
+        guidance=0.0,
+        width=1024,
+        height=1024,
+        face_scale=1.0,
+        bgstyle_scale=1.0,
+        onlystyle=False,
+        **kwargs,
+    ):
+        # Flux Schnell 建议 guidance_scale=0, steps=4
+        if self.model_id == "flux_schnell":
+            guidance = 0.0
+            steps = min(max(steps, 1), 4)
+        gen = torch.Generator(device=self._device).manual_seed(seed) if seed else None
+        out = self._pipe(
+            prompt,
+            guidance_scale=guidance,
+            num_inference_steps=steps,
+            generator=gen,
+            height=height,
+            width=width,
+            **kwargs,
+        )
+        return out.images[0]
+
+
+# ---- 开源后端：Z-Image-Turbo（阿里）----
+class _ZImageTurboAdapter:
+    """阿里 Z-Image-Turbo 文生图占位实现。接入时在此加载对应 diffusers 管线并实现 generate_face_style。"""
+
+    def __init__(self, device=None, **kwargs):
+        self._device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+        self._pipe = None
+        try:
+            # 若有官方/社区 diffusers 管线，在此 from_pretrained
+            from diffusers import AutoPipelineForText2Image
+            self._pipe = AutoPipelineForText2Image.from_pretrained(
+                "Alibaba-Nano/Z-Image-Turbo", torch_dtype=torch.float16, **kwargs
+            )
+            self._pipe.to(self._device)
+        except Exception as e:
+            logger.warning("Z-Image-Turbo 加载失败，将使用占位返回: %s", e)
+            self._pipe = None
+
+    def generate_face_style(
+        self,
+        face_image,
+        style_images,
+        prompt,
+        negative_prompt="",
+        steps=4,
+        seed=0,
+        guidance=1.0,
+        width=1024,
+        height=1024,
+        face_scale=1.0,
+        bgstyle_scale=1.0,
+        onlystyle=False,
+        **kwargs,
+    ):
+        if self._pipe is None:
+            # 占位：返回纯色图，便于联调
+            from PIL import Image
+            return Image.new("RGB", (width, height), color=(128, 128, 128))
+        gen = torch.Generator(device=self._device).manual_seed(seed) if seed else None
+        out = self._pipe(
+            prompt,
+            negative_prompt=negative_prompt or None,
+            num_inference_steps=steps,
+            guidance_scale=guidance,
+            generator=gen,
+            height=height,
+            width=width,
+            **kwargs,
+        )
+        return out.images[0]
+
+    def generate_face_style_mask(self, *args, **kwargs):
+        raise NotImplementedError("Z-Image-Turbo 暂不支持 generate_face_style_mask。")
+
+
+# ---- 商用后端：Nano Banana Pro / 通义 / 字节 / Kling 统一 HTTP 适配器 ----
+class _CommercialT2IAdapter:
+    """商用 T2I/I2I 统一适配：按 model_id 读配置并调用对应 API。"""
+
+    def __init__(self, model_id, **kwargs):
+        from config_loader import get_t2i_config
+        self.model_id = (model_id or "").strip().lower()
+        self._api_key, self._base_url, self._model_name = get_t2i_config(self.model_id)
+        self._client = None
+        if self._api_key:
+            self._prepare_client()
+
+    def _prepare_client(self):
+        if self.model_id == "tongyi":
+            try:
+                from openai import OpenAI
+                self._client = OpenAI(api_key=self._api_key, base_url=self._base_url or "https://dashscope.aliyuncs.com/compatible-mode/v1")
+            except Exception as e:
+                logger.warning("通义 T2I client 初始化失败: %s", e)
+        elif self.model_id in ("nano_banana_pro", "bytedance", "kling"):
+            # 占位：按各厂商 API 文档实现 HTTP 调用
+            self._client = "placeholder"
+
+    def generate_face_style(
+        self,
+        face_image,
+        style_images,
+        prompt,
+        negative_prompt="",
+        steps=4,
+        seed=0,
+        guidance=1.0,
+        width=1024,
+        height=1024,
+        face_scale=1.0,
+        bgstyle_scale=1.0,
+        onlystyle=False,
+        **kwargs,
+    ):
+        from PIL import Image
+        if not self._api_key:
+            logger.warning("商用 T2I 未配置 api_key，返回占位图。请设置 T2I_%s_API_KEY", self.model_id.upper().replace("-", "_"))
+            return Image.new("RGB", (width, height), color=(128, 128, 128))
+        # 商用 API 调用占位：T2I 走各厂商 imagen/wanx 等接口
+        if self.model_id == "tongyi" and self._client and self._client != "placeholder":
+            return self._tongyi_t2i(prompt, negative_prompt, width, height, seed)
+        return Image.new("RGB", (width, height), color=(128, 128, 128))
+
+    def _tongyi_t2i(self, prompt, negative_prompt, width, height, seed):
+        """通义万相 T2I：通过 dashscope ImageSynthesis 调用 wanx。"""
+        from PIL import Image
+        import io
+        import requests
+        try:
+            import dashscope
+            from dashscope import ImageSynthesis
+            dashscope.api_key = self._api_key
+            size_map = ["1024*1024", "720*1280", "1280*720"]
+            size = "%d*%d" % (width, height) if (width, height) in [(1024, 1024), (720, 1280), (1280, 720)] else "1024*1024"
+            if size not in size_map:
+                size = "1024*1024"
+            kw = {"model": self._model_name or "wanx-v1", "prompt": prompt, "n": 1, "size": size}
+            if negative_prompt:
+                kw["negative_prompt"] = negative_prompt
+            resp = ImageSynthesis.call(**kw)
+            if resp and getattr(resp, "status_code", None) == 200 and getattr(resp, "output", None):
+                out = resp.output
+                results = getattr(out, "results", None) or []
+                if results and getattr(results[0], "url", None):
+                    r = requests.get(results[0].url, timeout=30)
+                    r.raise_for_status()
+                    img = Image.open(io.BytesIO(r.content)).convert("RGB")
+                    if (img.width, img.height) != (width, height):
+                        img = img.resize((width, height), Image.Resampling.LANCZOS)
+                    return img
+        except Exception as e:
+            logger.warning("通义 T2I 调用失败: %s", e)
+        return Image.new("RGB", (width, height), color=(128, 128, 128))
+
+    def generate_face_style_mask(self, *args, **kwargs):
+        raise NotImplementedError("商用后端暂不支持 generate_face_style_mask，请使用 ipadapter。")
+
+
+# ---- 阶段5：文生图/图生图模型可插拔入口；backend + model_id 多后端（AGENT.md 3.2）----
+def get_t2i_model(backend=None, model_id=None, name=None, **kwargs):
+    """
+    按 backend + model_id 或兼容旧参 name 返回 T2I/I2I 模型实例。
+    - backend: "open_source" | "commercial"
+    - model_id: 开源 flux_dev, flux_schnell, z_image_turbo, sdxl_lightning, sd15, ipadapter；
+                商用 nano_banana_pro, tongyi, bytedance, kling
+    - name: 兼容旧用法，等价于 model_id；当 backend/model_id 未传时从环境变量 T2I_BACKEND、T2I_MODEL 读取。
+    返回对象均支持 generate_face_style(face_image, style_images, prompt, negative_prompt, ...)。
+    """
+    # 从环境变量补全
+    backend = backend or os.environ.get("T2I_BACKEND", "").strip().lower()
+    model_id = (model_id or name or os.environ.get("T2I_MODEL", "sdxl_lightning")).strip().lower()
+    if not backend:
+        backend = T2I_BACKEND_COMMERCIAL if model_id in T2I_COMMERCIAL_MODEL_IDS else T2I_BACKEND_OPEN_SOURCE
+    if name and not model_id:
+        model_id = name.strip().lower()
+
+    if model_id in ("ip_adapter", "ipadapter"):
+        model_id = "ipadapter"
+
+    if backend == T2I_BACKEND_COMMERCIAL:
+        if model_id not in T2I_COMMERCIAL_MODEL_IDS:
+            model_id = T2I_COMMERCIAL_MODEL_IDS[0] if T2I_COMMERCIAL_MODEL_IDS else "nano_banana_pro"
+        return _CommercialT2IAdapter(model_id=model_id, **kwargs)
+
+    # open_source
+    if model_id == "flux_dev":
+        return _FluxT2IAdapter(model_id="flux_dev", **kwargs)
+    if model_id == "flux_schnell":
+        return _FluxT2IAdapter(model_id="flux_schnell", **kwargs)
+    if model_id == "z_image_turbo":
+        return _ZImageTurboAdapter(**kwargs)
+    if model_id == "sdxl_lightning":
+        inner = sdxl_lightning_model(**kwargs)
+        return _UnifiedT2IWrapper(inner)
+    if model_id == "sd15":
+        inner = sd15_model(**kwargs)
+        return _UnifiedT2IWrapper(inner)
+    if model_id == "ipadapter":
         return ipadapter_model_multi_adapter(lightning=True, **kwargs)
-    return sdxl_lightning_model(**kwargs)
+
+    # 未识别时回退
+    if model_id in T2I_OPEN_SOURCE_MODEL_IDS:
+        return get_t2i_model(backend=T2I_BACKEND_OPEN_SOURCE, model_id=model_id, **kwargs)
+    return get_t2i_model(backend=T2I_BACKEND_OPEN_SOURCE, model_id="sdxl_lightning", **kwargs)
 
 
 def regenerate_template():

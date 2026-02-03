@@ -35,7 +35,15 @@
 ```
 cursor_coding/
 ├── Backend/                    # 后端与主应用目录（运行故事生成时应以 Backend 为工作目录）
-│   ├── story_generate.py       # Gradio 主入口、五 Tab 流程与状态
+│   ├── story_generate.py       # 入口：调用 story_ui.build_app(t2imodel) 并 launch
+│   ├── story_ui/               # 五大环节 UI 包（可单 Tab 独立运行调试）
+│   │   ├── app.py              # build_app(t2imodel) 组装五 Tab
+│   │   ├── shared.py           # 常量、默认 prompt、跨 Tab 小工具与库读写
+│   │   ├── tab1_story.py       # 1、故事与剧本
+│   │   ├── tab2_characters.py  # 2、角色与场景
+│   │   ├── tab3_refs_shots.py  # 3、角色/场景图与分镜画面
+│   │   ├── tab4_voice_video.py # 4、配音与分镜视频
+│   │   └── tab5_export.py      # 5、成片导出
 │   ├── llm.py                  # LLM 调用与故事/分镜类 prompt
 │   ├── config_loader.py        # 统一配置（.env / config.toml）
 │   ├── video_gen.py            # 分镜视频统一入口（slideshow / i2v / t2v）
@@ -57,12 +65,12 @@ cursor_coding/
 
 ## 3. 模块功能说明
 
-### 3.1 `Backend/story_generate.py`
+### 3.1 `Backend/story_generate.py` 与 `Backend/story_ui/`
 
-- **职责**：Gradio 主应用、五 Tab UI、跨 Tab 状态（`state_full_story`、`state_segments`、`state_global_characters`、`state_global_scenes`、`state_storyboards`、分镜图/音/视）。
-- **入口**：`python story_generate.py`（需在 `Backend` 目录下执行，保证 `from tool.`、`from mora.` 等可用）。
-- **关键依赖**：`mora.generate_image`（T2I）、`llm`（扩写/分镜/角色场景）、`video_gen`、`video_utils.comb_video`、`tts_utils`、`tool.novel_parser`、`mora.consistency_9grid`（可选）。
-- **分镜图来源**：默认从 9 宫格取图（`_fenjin_img_from_9grid`，`set_lib/character|<场景>/grid_9/{0~8}.png`）；可通过 `use_legacy_consistency` 切回 IP-Adapter 路径。
+- **story_generate.py**：瘦身后的入口，仅调用 `story_ui.app.build_app(t2imodel)` 并 `.queue().launch(...)`；`python story_generate.py` 需在 `Backend` 目录下执行。
+- **story_ui/**：五大环节的 UI 与逻辑按 Tab 拆分为 `tab1_story`～`tab5_export`，公共常量与小工具在 `shared.py`，`app.build_app(t2imodel)` 负责创建 State、依次挂载各 Tab 并传入统一 `ctx`。
+- **单 Tab 独立运行**：`python -m story_ui.tab1_story`（或 tab2/3/4/5）可仅启动该环节页面以便调试，见 `Backend/story_ui/README.md` 与 `Backend/REFACTOR_PLAN.md`。
+- **分镜图来源**：在 `tab3_refs_shots` / `tab4_voice_video` 中，默认从 9 宫格取图（`set_lib/character|scene/.../grid_9/{0~8}.png`）；可在 tab3 中设 `USE_LEGACY_CONSISTENCY=True` 切回 IP-Adapter 路径。
 
 ### 3.2 `Backend/llm.py`
 
